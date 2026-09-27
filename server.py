@@ -31,6 +31,7 @@ ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
 TTL_SECONDS = 45
 KLINE_LIMIT = 200
+HISTORY_BARS = 1000
 
 COINS = [
     ("BTCUSDT", "BTC", "Bitcoin"),
@@ -90,6 +91,23 @@ async def get_json(client: httpx.AsyncClient, sem: asyncio.Semaphore, path: str,
     raise RuntimeError(f"{path} failed")
 
 
+def public_candles(candles: list[dict]) -> list[dict]:
+    packed = []
+    for candle in candles:
+        packed.append(
+            {
+                "t": int(candle["t"]),
+                "o": round(float(candle["o"]), 8),
+                "h": round(float(candle["h"]), 8),
+                "l": round(float(candle["l"]), 8),
+                "c": round(float(candle["c"]), 8),
+                "quote_volume": round(float(candle.get("quote_volume") or 0), 2),
+                "taker_buy_quote": round(float(candle.get("taker_buy_quote") or 0), 2),
+            }
+        )
+    return packed
+
+
 def parse_klines(raw: list) -> list[dict]:
     candles = []
     for row in raw:
@@ -131,17 +149,24 @@ async def build_coin(client: httpx.AsyncClient, sem: asyncio.Semaphore, spec: tu
     symbol, base, name = spec
     try:
         requests = [
-            get_json(client, sem, "/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": KLINE_LIMIT})
+            get_json(
+                client,
+                sem,
+                "/api/v3/klines",
+                {"symbol": symbol, "interval": interval, "limit": HISTORY_BARS if interval == "4h" else KLINE_LIMIT},
+            )
             for interval, _label in TIMEFRAMES
         ]
         requests.append(get_json(client, sem, "/api/v3/klines", {"symbol": symbol, "interval": "1m", "limit": 60}))
         requests.append(get_json(client, sem, "/api/v3/depth", {"symbol": symbol, "limit": 1000}))
         requests.append(get_json(client, sem, "/api/v3/aggTrades", {"symbol": symbol, "limit": 1000}))
         *kline_sets, minute_raw, depth, trades = await asyncio.gather(*requests)
+        parsed_sets = [parse_klines(raw) for raw in kline_sets]
         timeframes = [
-            analyze_timeframe(parse_klines(raw), interval, label)
-            for raw, (interval, label) in zip(kline_sets, TIMEFRAMES)
+            analyze_timeframe(candles, interval, label)
+            for candles, (interval, label) in zip(parsed_sets, TIMEFRAMES)
         ]
+        four_raw = next(candles for candles, (interval, _label) in zip(parsed_sets, TIMEFRAMES) if interval == "4h")
         minute_candles = parse_klines(minute_raw)
         four_hour = next(timeframe for timeframe in timeframes if timeframe["interval"] == "4h")
         price = ticker["last"] if ticker else four_hour["candles"][-1]["c"]
@@ -169,6 +194,7 @@ async def build_coin(client: httpx.AsyncClient, sem: asyncio.Semaphore, spec: tu
                 "heatmap": heatmap,
                 "profile": profile,
                 "flow": four_hour.get("order_flow") or [],
+                "history": public_candles(four_raw),
             },
         }
     except Exception as exc:
@@ -233,15 +259,26 @@ def aggregate_candles(candles: list[dict], bucket_ms: int) -> list[dict]:
     return merged
 
 
-async def fetch_yahoo(client: httpx.AsyncClient, sem: asyncio.Semaphore, symbol: str, interval: str, span: str) -> dict:
+async def fetch_yahoo(
+    client: httpx.AsyncClient,
+    sem: asyncio.Semaphore,
+    symbol: str,
+    interval: str,
+    span: str | None = None,
+    period1: int | None = None,
+    period2: int | None = None,
+) -> dict:
+    params = {"interval": interval, "includePrePost": "false"}
+    if period1 is not None and period2 is not None:
+        params["period1"] = int(period1)
+        params["period2"] = int(period2)
+    else:
+        params["range"] = span
     delay = 0.4
     response = None
     async with sem:
         for _attempt in range(3):
-            response = await client.get(
-                f"/{symbol}",
-                params={"interval": interval, "range": span, "includePrePost": "false"},
-            )
+            response = await client.get(f"/{symbol}", params=params)
             if response.status_code in {418, 429, 500, 502, 503}:
                 await asyncio.sleep(delay)
                 delay *= 2
@@ -291,10 +328,11 @@ async def build_etf(client: httpx.AsyncClient, sem: asyncio.Semaphore, base: str
         )
         hourly_candles = parse_yahoo_candles(hourly)
         daily_candles = parse_yahoo_candles(daily)
+        four_all = aggregate_candles(hourly_candles, 4 * 60 * 60 * 1000)
         frames = {
             "15m": parse_yahoo_candles(intraday)[-200:],
             "1h": hourly_candles[-200:],
-            "4h": aggregate_candles(hourly_candles, 4 * 60 * 60 * 1000)[-200:],
+            "4h": four_all,
             "1D": daily_candles[-200:],
         }
         if any(len(frame) < 30 for frame in frames.values()):
@@ -328,6 +366,7 @@ async def build_etf(client: httpx.AsyncClient, sem: asyncio.Semaphore, base: str
                 "heatmap": [],
                 "profile": [],
                 "flow": four_hour.get("order_flow") or [],
+                "history": public_candles(four_all),
             },
         }
     except Exception as exc:
@@ -397,6 +436,78 @@ async def build_desk() -> dict:
 @app.get("/api/health")
 def health():
     return {"ok": True}
+
+
+def _known_symbol(symbol: str, market: str) -> bool:
+    if market == "etf":
+        return symbol in {item[0] for item in ETFS.values()}
+    return symbol in {item[0] for item in COINS}
+
+
+async def spot_history(symbol: str, end: int, limit: int, interval: str = "4h") -> list[dict]:
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    if end > 0:
+        params["endTime"] = end - 1
+    timeout = httpx.Timeout(20.0, connect=10.0)
+    async with httpx.AsyncClient(base_url=BASE, timeout=timeout, headers={"User-Agent": "flow-desk"}) as client:
+        raw = await get_json(client, asyncio.Semaphore(1), "/api/v3/klines", params)
+    candles = public_candles(parse_klines(raw))
+    if end > 0:
+        candles = [candle for candle in candles if candle["t"] < end]
+    return candles
+
+
+async def etf_history(symbol: str, end: int, limit: int, interval: str = "4h") -> list[dict]:
+    yahoo_interval = {"15m": "15m", "1h": "60m", "4h": "60m", "1d": "1d"}[interval]
+    span = {"15m": "60d", "1h": "1y", "4h": "1y", "1d": "5y"}[interval]
+    bar_seconds = {"15m": 15 * 60, "1h": 3600, "4h": 3600, "1d": 86400}[interval]
+    bars_needed = limit * (4 if interval == "4h" else 1)
+    timeout = httpx.Timeout(20.0, connect=10.0)
+    headers = {"User-Agent": "Mozilla/5.0"}
+    async with httpx.AsyncClient(base_url=YAHOO, timeout=timeout, headers=headers) as client:
+        if end > 0:
+            period2 = int(end / 1000)
+            period1 = period2 - (bars_needed + 48) * bar_seconds
+            result = await fetch_yahoo(
+                client,
+                asyncio.Semaphore(1),
+                symbol,
+                yahoo_interval,
+                period1=period1,
+                period2=period2,
+            )
+        else:
+            result = await fetch_yahoo(client, asyncio.Semaphore(1), symbol, yahoo_interval, span)
+    candles = parse_yahoo_candles(result)
+    if interval == "4h":
+        candles = aggregate_candles(candles, 4 * 60 * 60 * 1000)
+    if end > 0:
+        candles = [candle for candle in candles if candle["t"] < end]
+    return public_candles(candles[-limit:])
+
+
+@app.get("/api/history")
+async def history(
+    symbol: str = Query(...),
+    market: str = Query("spot"),
+    interval: str = Query("4h"),
+    end: int = Query(0),
+    limit: int = Query(500),
+):
+    symbol = symbol.upper().strip()
+    market = "etf" if market == "etf" else "spot"
+    interval = interval if interval in {"15m", "1h", "4h", "1d"} else "4h"
+    limit = max(50, min(HISTORY_BARS, limit))
+    if not _known_symbol(symbol, market):
+        raise HTTPException(status_code=404, detail="Unknown symbol")
+    try:
+        candles = await (
+            etf_history(symbol, end, limit, interval) if market == "etf" else spot_history(symbol, end, limit, interval)
+        )
+    except Exception as exc:
+        log.warning("history failed for %s: %s", symbol, exc)
+        raise HTTPException(status_code=503, detail="Earlier candles are unavailable right now.") from exc
+    return {"candles": candles}
 
 
 @app.get("/api/desk")

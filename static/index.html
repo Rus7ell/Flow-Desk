@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,560;9..144,640&family=IBM+Plex+Mono:wght@400;500&family=Outfit:wght@400;500;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/styles.css?v=7">
+  <link rel="stylesheet" href="/static/styles.css?v=10">
 </head>
 <body>
   <div class="wrap">
@@ -31,7 +31,7 @@
       <p class="loading">Reading candles, trades, and the visible book for ten markets.</p>
     </main>
     <footer>
-      <p>Each chart starts on the full 4h range. The line is traded order flow across that whole range: yellow is smaller size and dark red is the largest. Under a coin, the listed US spot ETF has its own chart and write-up from that fund's trading. Expand a chart to scroll and zoom. Momentum confidence mixes structure, RSI, and MACD, and the coin's book when one is visible. This is a market read, not a recommendation to trade.</p>
+      <p>Each chart starts on the full 4h range. The line is traded order flow across that whole range: yellow is smaller size and dark red is the largest. Under a coin, the listed US spot ETF has its own chart and write-up from that fund's trading. Expand a chart to move through price and earlier candles. Scrolling past the loaded data fills in the missing candles and order flow. Momentum confidence mixes structure, RSI, and MACD, and the coin's book when one is visible. This is a market read, not a recommendation to trade.</p>
     </footer>
   </div>
   <dialog id="chart-dialog" aria-labelledby="dialog-title">
@@ -49,11 +49,17 @@
           <button type="button" data-act="close" class="close-chart">Close</button>
         </div>
       </header>
+      <div class="dialog-frames" id="dialog-frames" role="group" aria-label="Timeframe">
+        <button type="button" data-tf="15m">15m</button>
+        <button type="button" data-tf="1h">1h</button>
+        <button type="button" data-tf="4h" aria-pressed="true">4h</button>
+        <button type="button" data-tf="1d">1D</button>
+      </div>
       <div id="dialog-stage"></div>
-      <p class="hint dialog-help">Drag or scroll to move along price. Zoom with the buttons, or pinch. Esc, Close, or the dark backdrop leaves the chart.</p>
+      <p class="hint dialog-help">Choose a timeframe to rebuild the order flow. One finger drags through price and time. Pinch to zoom. Scrolling past the edge loads earlier candles. Esc, Close, or the dark backdrop leaves the chart.</p>
     </div>
   </dialog>
   <div id="dialog-tip" class="chart-tip" hidden></div>
-  <script src="/static/app.js?v=10"></script>
+  <script src="/static/app.js?v=15"></script>
 </body>
 </html>

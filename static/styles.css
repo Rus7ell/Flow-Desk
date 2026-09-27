@@ -357,7 +357,7 @@ h2, h3 {
 
 .chart { margin: 4px 0 12px; }
 
-.chart svg, #dialog-stage svg { width: 100%; height: auto; display: block; }
+.chart svg, #dialog-stage svg { width: 100%; height: auto; display: block; overflow: hidden; }
 .chart text, #dialog-stage text { font-family: "IBM Plex Mono", ui-monospace, monospace; }
 
 .chart-open {
@@ -378,8 +378,8 @@ h2, h3 {
 
 .expand-label {
   position: absolute;
-  top: 8px;
-  right: 8px;
+  top: 10px;
+  left: 10px;
   z-index: 1;
   border-radius: 999px;
   padding: 6px 12px;
@@ -397,6 +397,7 @@ h2, h3 {
 
 #chart-dialog {
   width: min(1180px, calc(100vw - 28px));
+  overscroll-behavior: contain;
   max-height: calc(100vh - 28px);
   margin: auto;
   padding: 0;
@@ -434,6 +435,31 @@ h2, h3 {
   font-size: 13px;
 }
 
+.dialog-frames {
+  display: flex;
+  gap: 8px;
+  margin: 0 0 10px;
+}
+
+.dialog-frames button {
+  flex: 1;
+  min-height: 42px;
+  font-size: 15px;
+}
+
+.dialog-frames button[aria-pressed="true"] {
+  background: var(--ink);
+  color: #1a160f;
+  border-color: var(--ink);
+  font-weight: 600;
+}
+
+.chart-wait {
+  margin: 72px 0;
+  text-align: center;
+  color: var(--muted);
+}
+
 .dialog-tools { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
 
 .close-chart {
@@ -444,6 +470,7 @@ h2, h3 {
 }
 
 #chart-dialog.dragging, #chart-dialog.dragging svg { cursor: grabbing; }
+#dialog-stage { touch-action: none; user-select: none; -webkit-user-select: none; }
 #dialog-stage svg { cursor: grab; touch-action: none; }
 
 .dialog-help { margin: 8px 0 0; }
@@ -460,7 +487,7 @@ h2, h3 {
   background: #121611;
   color: var(--ink);
   font-family: "IBM Plex Mono", ui-monospace, monospace;
-  font-size: 12px;
+  font-size: 15px;
   pointer-events: none;
   box-shadow: var(--shadow);
 }

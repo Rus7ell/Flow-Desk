@@ -1,4 +1,6 @@
 const state = { filter: "all", loading: false, data: null, expanded: null };
+const pointers = new Map();
+let drawQueued = false;
 
 const FILTERS = [
   ["all", "All"],
@@ -108,9 +110,24 @@ function renderSummary(data) {
   stampEl.textContent = clock ? `Updated ${clock}${age}${stale}` : "Updated";
 }
 
-function formatAxisTime(ms) {
+const CHART_FRAMES = [
+  ["15m", "15m", "15 minute"],
+  ["1h", "1h", "1 hour"],
+  ["4h", "4h", "4 hour"],
+  ["1d", "1D", "1 day"],
+];
+
+function frameLabel(interval) {
+  return CHART_FRAMES.find((frame) => frame[0] === interval)?.[2] || "4 hour";
+}
+
+function formatAxisTime(ms, interval) {
   const date = new Date(ms);
   if (Number.isNaN(date.getTime())) return "";
+  if (interval === "1d") return date.toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" });
+  if (interval === "15m" || interval === "1h") {
+    return date.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  }
   return date.toLocaleString([], { month: "short", day: "numeric", hour: "numeric" });
 }
 
@@ -127,7 +144,7 @@ function flowRows(coin) {
 
 function chartBounds(coin) {
   const candles = (coin.chart || {}).candles || [];
-  const rows = profileRows(coin);
+  const rows = [...profileRows(coin), ...flowRows(coin)];
   const levels = ((coin.chart || {}).levels || []).map((level) => level.price);
   const highs = [
     ...candles.map((candle) => candle.h),
@@ -217,6 +234,357 @@ function orderPeaks(rows) {
     .filter((row) => row.notional >= largest * 0.18);
 }
 
+function mergeHistory(older, fresh) {
+  const byTime = new Map();
+  for (const candle of older || []) byTime.set(candle.t, candle);
+  for (const candle of fresh || []) byTime.set(candle.t, candle);
+  return [...byTime.values()].sort((left, right) => left.t - right.t);
+}
+
+function carryCharts(previous, incoming) {
+  if (!previous) return;
+  const prior = new Map();
+  const remember = (item) => {
+    if (!item?.chart || !item.base) return;
+    const frames = { ...(item.chart.frames || {}) };
+    if (item.chart.history?.length) frames["4h"] = item.chart.history;
+    if (Object.keys(frames).length) prior.set(`${item.market || "spot"}:${item.base}`, frames);
+  };
+  for (const coin of previous.coins || []) {
+    remember(coin);
+    remember(coin.etf);
+  }
+  const apply = (item) => {
+    if (!item?.chart || !item.base) return;
+    const oldFrames = prior.get(`${item.market || "spot"}:${item.base}`);
+    if (!oldFrames) return;
+    item.chart.frames = item.chart.frames || {};
+    for (const [interval, oldHist] of Object.entries(oldFrames)) {
+      const fresh = interval === "4h" ? item.chart.history : item.chart.frames[interval];
+      const merged = mergeHistory(oldHist, fresh);
+      item.chart.frames[interval] = merged;
+      if (interval === "4h") item.chart.history = merged;
+      const open = state.expanded;
+      const sameChart = open
+        && open.base === item.base
+        && (open.market || "spot") === (item.market || "spot")
+        && (open.interval || "4h") === interval;
+      const addedFront = merged.findIndex((candle) => candle.t === oldHist[0]?.t);
+      if (sameChart && addedFront > 0) {
+        open.start += addedFront;
+        open.end += addedFront;
+        if (open.drag) {
+          open.drag.start += addedFront;
+          open.drag.end += addedFront;
+        }
+        if (open.pinch) {
+          open.pinch.start += addedFront;
+          open.pinch.end += addedFront;
+        }
+      }
+    }
+  };
+  for (const coin of incoming.coins || []) {
+    apply(coin);
+    apply(coin.etf);
+  }
+}
+
+function activeInterval(coin) {
+  const open = state.expanded;
+  if (!open || !coin) return "4h";
+  if (open.base === coin.base && (open.market || "spot") === (coin.market || "spot")) return open.interval || "4h";
+  return "4h";
+}
+
+function frameCandles(coin, interval) {
+  const chart = coin.chart || (coin.chart = {});
+  if (!chart.frames) chart.frames = {};
+  const key = interval || "4h";
+  if (key === "4h") {
+    if (chart.frames["4h"]?.length) {
+      chart.history = chart.frames["4h"];
+      return chart.frames["4h"];
+    }
+    if (Array.isArray(chart.history) && chart.history.length) {
+      chart.frames["4h"] = chart.history;
+      return chart.history;
+    }
+    chart.history = (chart.candles || []).map((candle) => ({ ...candle }));
+    chart.frames["4h"] = chart.history;
+    return chart.history;
+  }
+  return chart.frames[key] || [];
+}
+
+function historyCandles(coin) {
+  return frameCandles(coin, activeInterval(coin));
+}
+
+function buildFlow(candles) {
+  const binCount = 72;
+  if (candles.length < 2) return [];
+  let low = Infinity;
+  let high = -Infinity;
+  for (const candle of candles) {
+    if (candle.l < low) low = candle.l;
+    if (candle.h > high) high = candle.h;
+  }
+  const span = high - low;
+  if (!(span > 0)) return [];
+  const step = span / binCount;
+  const bins = Array.from({ length: binCount }, (_, index) => ({
+    low: low + index * step,
+    high: low + (index + 1) * step,
+    buy: 0,
+    sell: 0,
+  }));
+  for (const candle of candles) {
+    const total = Number(candle.quote_volume) || 0;
+    if (total <= 0) continue;
+    const buy = Math.min(total, Number(candle.taker_buy_quote) || 0);
+    const sell = total - buy;
+    const candleLow = Number(candle.l);
+    const candleHigh = Number(candle.h);
+    const candleSpan = candleHigh - candleLow;
+    if (candleSpan <= 0) {
+      const index = Math.min(binCount - 1, Math.max(0, Math.floor((candleLow - low) / step)));
+      bins[index].buy += buy;
+      bins[index].sell += sell;
+      continue;
+    }
+    for (const item of bins) {
+      const overlap = Math.min(candleHigh, item.high) - Math.max(candleLow, item.low);
+      if (overlap <= 0) continue;
+      const share = overlap / candleSpan;
+      item.buy += buy * share;
+      item.sell += sell * share;
+    }
+  }
+  const populated = bins.filter((item) => item.buy + item.sell > 0);
+  if (!populated.length) return [];
+  const largest = Math.max(...populated.map((item) => item.buy + item.sell)) || 1;
+  const profile = [];
+  for (const item of populated) {
+    const notional = item.buy + item.sell;
+    if (notional < largest * 0.004) continue;
+    let side = "mixed";
+    if (item.buy > item.sell * 1.15) side = "buy";
+    else if (item.sell > item.buy * 1.15) side = "sell";
+    profile.push({
+      low: item.low,
+      high: item.high,
+      price: (item.low + item.high) / 2,
+      notional,
+      side,
+    });
+  }
+  return profile;
+}
+
+function ensureFlow(coin, candles) {
+  const chart = coin.chart || {};
+  const first = candles[0]?.t;
+  const last = candles[candles.length - 1]?.t;
+  const cache = chart._flow;
+  if (cache && cache.n === candles.length && cache.first === first && cache.last === last) return cache.rows;
+  const built = buildFlow(candles);
+  const rows = built.length ? built : (activeInterval(coin) === "4h" ? flowRows(coin) : []);
+  chart._flow = { n: candles.length, first, last, rows };
+  return rows;
+}
+
+function detectSwings(candles) {
+  const left = 3;
+  const right = 3;
+  const swings = [];
+  if (candles.length < left + right + 1) return swings;
+  for (let index = left; index < candles.length - right; index += 1) {
+    let leftHigh = -Infinity;
+    let rightHigh = -Infinity;
+    let leftLow = Infinity;
+    let rightLow = Infinity;
+    for (let pos = index - left; pos < index; pos += 1) {
+      leftHigh = Math.max(leftHigh, candles[pos].h);
+      leftLow = Math.min(leftLow, candles[pos].l);
+    }
+    for (let pos = index + 1; pos <= index + right; pos += 1) {
+      rightHigh = Math.max(rightHigh, candles[pos].h);
+      rightLow = Math.min(rightLow, candles[pos].l);
+    }
+    if (candles[index].h > leftHigh && candles[index].h >= rightHigh) {
+      swings.push({ index, price: candles[index].h, type: "high" });
+    }
+    if (candles[index].l < leftLow && candles[index].l <= rightLow) {
+      swings.push({ index, price: candles[index].l, type: "low" });
+    }
+  }
+  swings.sort((a, b) => a.index - b.index || (a.type === "high" ? -1 : 1));
+  let lastHigh = null;
+  let lastLow = null;
+  for (const swing of swings) {
+    if (swing.type === "high") {
+      if (lastHigh != null) {
+        swing.relation = swing.price > lastHigh ? "HH" : swing.price < lastHigh ? "LH" : "EH";
+      }
+      lastHigh = swing.price;
+    } else {
+      if (lastLow != null) {
+        swing.relation = swing.price > lastLow ? "HL" : swing.price < lastLow ? "LL" : "EL";
+      }
+      lastLow = swing.price;
+    }
+  }
+  for (const side of ["high", "low"]) {
+    const matching = swings.filter((swing) => swing.type === side && swing.relation);
+    for (const swing of matching.slice(0, -3)) swing.relation = null;
+  }
+  return swings;
+}
+
+function ensureSwings(coin, candles) {
+  const chart = coin.chart || {};
+  const first = candles[0]?.t;
+  const cache = chart._swings;
+  if (cache && cache.n === candles.length && cache.first === first) return cache.rows;
+  const rows = detectSwings(candles);
+  chart._swings = { n: candles.length, first, rows };
+  return rows;
+}
+
+function candleExtent(candles) {
+  let min = Infinity;
+  let max = -Infinity;
+  for (const candle of candles) {
+    if (candle.l < min) min = candle.l;
+    if (candle.h > max) max = candle.h;
+  }
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return null;
+  return { min, max };
+}
+
+function loadedExtent(coin) {
+  const candles = historyCandles(coin);
+  const flow = ensureFlow(coin, candles);
+  const book = profileRows(coin);
+  const extent = candleExtent(candles);
+  const highs = [...flow.map((row) => row.high), ...book.map((row) => row.high)];
+  const lows = [...flow.map((row) => row.low), ...book.map((row) => row.low)];
+  if (extent) {
+    highs.push(extent.max);
+    lows.push(extent.min);
+  }
+  if (!highs.length) return extent;
+  return { min: Math.min(...lows), max: Math.max(...highs) };
+}
+
+function fitPrice(min, max, coin, extent) {
+  const anchor = Math.abs(coin.price || extent?.max || 1);
+  const minSpan = anchor * 0.00035;
+  if (!(max > min)) {
+    const mid = Number.isFinite(min) ? min : anchor;
+    min = mid - minSpan / 2;
+    max = mid + minSpan / 2;
+  }
+  if (max - min < minSpan) {
+    const mid = (min + max) / 2;
+    min = mid - minSpan / 2;
+    max = mid + minSpan / 2;
+  }
+  if (extent) {
+    const dataSpan = Math.max(extent.max - extent.min, minSpan);
+    const slack = Math.max(dataSpan * 0.75, (max - min) * 0.85);
+    if (max > extent.max + slack) {
+      const shift = max - (extent.max + slack);
+      min -= shift;
+      max -= shift;
+    }
+    if (min < extent.min - slack) {
+      const shift = extent.min - slack - min;
+      min += shift;
+      max += shift;
+    }
+  }
+  return { min, max };
+}
+
+function fitTime(start, end, length) {
+  const count = Math.max(length, 1);
+  let span = end - start;
+  const minSpan = Math.min(18, count);
+  const maxSpan = Math.max(minSpan, count + 80);
+  if (!(span > 0)) span = Math.min(140, count);
+  if (span < minSpan) {
+    const mid = (start + end) / 2;
+    start = mid - minSpan / 2;
+    end = mid + minSpan / 2;
+    span = minSpan;
+  } else if (span > maxSpan) {
+    const mid = (start + end) / 2;
+    start = mid - maxSpan / 2;
+    end = mid + maxSpan / 2;
+    span = maxSpan;
+  }
+  const slack = Math.max(48, span * 0.85);
+  if (end > count + slack) {
+    const shift = end - (count + slack);
+    start -= shift;
+    end -= shift;
+  }
+  if (start < -slack) {
+    const shift = -slack - start;
+    start += shift;
+    end += shift;
+  }
+  return { start, end };
+}
+
+function expandedHome(coin) {
+  const candles = historyCandles(coin);
+  const visible = Math.min(140, candles.length);
+  const start = Math.max(0, candles.length - visible);
+  const end = candles.length;
+  const flow = ensureFlow(coin, candles);
+  const book = profileRows(coin);
+  const slice = candles.slice(start, end);
+  const highs = [
+    ...slice.map((candle) => candle.h),
+    ...flow.map((row) => row.high),
+    ...book.map((row) => row.high),
+  ];
+  const lows = [
+    ...slice.map((candle) => candle.l),
+    ...flow.map((row) => row.low),
+    ...book.map((row) => row.low),
+  ];
+  let min = Math.min(...lows);
+  let max = Math.max(...highs);
+  const span = max - min || Math.abs(max) || 1;
+  min -= span * 0.04;
+  max += span * 0.04;
+  return { start, end, min, max };
+}
+
+function mountainPath(ordered, yOf, reach, baseline) {
+  if (!ordered.length) return "";
+  const ridge = [[baseline, yOf(ordered[0].high)]];
+  ordered.forEach((row, index) => {
+    if (index > 0) {
+      const gapTop = yOf(ordered[index - 1].low);
+      const gapBottom = yOf(row.high);
+      if (gapBottom - gapTop > 1.25) {
+        ridge.push([baseline, gapTop]);
+        ridge.push([baseline, gapBottom]);
+      }
+    }
+    const xOut = reach(row);
+    ridge.push([xOut, yOf(row.high)]);
+    ridge.push([xOut, yOf(row.low)]);
+  });
+  ridge.push([baseline, yOf(ordered[ordered.length - 1].low)]);
+  return ridge.map((point, index) => `${index ? "L" : "M"}${point[0].toFixed(1)},${point[1].toFixed(1)}`).join(" ");
+}
+
 function sideWord(side) {
   if (side === "bid") return "bids";
   if (side === "ask") return "asks";
@@ -227,21 +595,26 @@ function sideWord(side) {
 
 function renderChart(coin, view, mode) {
   const chart = coin.chart || {};
-  const candles = chart.candles || [];
-  const bookRows = profileRows(coin);
-  const rows = mode === "expanded" && bookRows.length ? bookRows : flowRows(coin);
   const expanded = mode === "expanded";
-  const width = expanded ? 1100 : 960;
+  const candles = expanded ? historyCandles(coin) : (chart.candles || []);
+  const swings = expanded ? ensureSwings(coin, candles) : (chart.swings || []);
+  const bookRows = profileRows(coin);
+  const flow = expanded ? ensureFlow(coin, candles) : flowRows(coin);
+  const width = expanded ? 1220 : 1100;
   const height = expanded ? 640 : 400;
   const pad = expanded ? { t: 18, b: 42, l: 78 } : { t: 16, b: 40, l: 68 };
-  const detailW = expanded ? 196 : 132;
+  const detailW = expanded ? 360 : 320;
   const heatW = expanded ? 188 : 118;
   const gap = 16;
   const candleRight = width - detailW - heatW - gap;
   const plotH = height - pad.t - pad.b;
-  const slot = (candleRight - pad.l) / candles.length;
+  const plotW = candleRight - pad.l;
+  const start = view.start == null ? 0 : view.start;
+  const end = view.end == null ? candles.length : view.end;
+  const span = (end - start) || 1;
+  const slot = plotW / span;
   const y = (price) => pad.t + ((view.max - price) / ((view.max - view.min) || 1)) * plotH;
-  const x = (index) => pad.l + slot * index + slot / 2;
+  const x = (index) => pad.l + ((index - start) / span) * plotW + slot / 2;
   const axisY = height - pad.b;
   let body = "";
   const clipId = `plot-${coin.base}-${mode}`;
@@ -257,19 +630,23 @@ function renderChart(coin, view, mode) {
   }
 
   body += `<g clip-path="url(#${clipId})">`;
-  candles.forEach((candle, index) => {
+  const firstVisible = Math.max(0, Math.floor(start) - 1);
+  const lastVisible = Math.min(candles.length - 1, Math.ceil(end) + 1);
+  for (let index = firstVisible; index <= lastVisible; index += 1) {
+    const candle = candles[index];
+    if (!candle) continue;
     const up = candle.c >= candle.o;
     const color = up ? "#8fceab" : "#e39b8b";
     const center = x(index);
-    const barW = Math.max(1.4, slot * 0.62);
+    const barW = Math.max(1.4, Math.min(slot * 0.62, 14));
     const top = y(Math.max(candle.o, candle.c));
     const bottom = y(Math.min(candle.o, candle.c));
     body += `<line x1="${center.toFixed(2)}" y1="${y(candle.h).toFixed(2)}" x2="${center.toFixed(2)}" y2="${y(candle.l).toFixed(2)}" stroke="${color}" stroke-width="1"/>`;
     body += `<rect x="${(center - barW / 2).toFixed(2)}" y="${Math.min(top, bottom).toFixed(2)}" width="${barW.toFixed(2)}" height="${Math.max(1, Math.abs(bottom - top)).toFixed(2)}" fill="${color}"/>`;
-  });
+  }
 
   for (const type of ["high", "low"]) {
-    const points = (chart.swings || []).filter((swing) => swing.type === type);
+    const points = swings.filter((swing) => swing.type === type);
     if (points.length < 2) continue;
     const path = points.map((swing, index) => `${index ? "L" : "M"}${x(swing.index).toFixed(1)},${y(swing.price).toFixed(1)}`).join(" ");
     body += `<path d="${path}" fill="none" stroke="${type === "high" ? "#e6b15c" : "#d5d0c4"}" stroke-width="1.2" opacity="0.75"/>`;
@@ -277,85 +654,97 @@ function renderChart(coin, view, mode) {
 
   const swingLabels = [];
   for (const type of ["high", "low"]) {
-    swingLabels.push(...(chart.swings || []).filter((swing) => swing.type === type && swing.relation).slice(-2));
+    const visible = swings.filter((swing) => {
+      if (swing.type !== type || !swing.relation) return false;
+      const center = x(swing.index);
+      return center >= pad.l && center <= candleRight;
+    });
+    swingLabels.push(...visible.slice(-2));
   }
   for (const swing of swingLabels) {
+    const center = x(swing.index);
+    if (center < pad.l || center > candleRight) continue;
     const lineY = y(swing.price);
     if (lineY < pad.t + 8 || lineY > axisY - 8) continue;
     const labelY = swing.type === "high" ? lineY - 6 : lineY + 12;
-    body += `<text x="${x(swing.index).toFixed(1)}" y="${labelY.toFixed(1)}" text-anchor="middle" fill="#f4f1e8" font-size="${expanded ? 11 : 10}">${esc(swing.relation)}</text>`;
+    body += `<text x="${center.toFixed(1)}" y="${labelY.toFixed(1)}" text-anchor="middle" fill="#f4f1e8" font-size="${expanded ? 11 : 10}">${esc(swing.relation)}</text>`;
   }
 
-  const maxNotional = rows.length ? Math.max(...rows.map((row) => row.notional)) : 1;
   const heatX = candleRight + gap;
   const baseline = heatX;
-  const reach = (row) => baseline + 4 + (row.notional / maxNotional) * (heatW - 14);
-  const ordered = [...rows].sort((left, right) => right.high - left.high);
-  if (ordered.length) {
-    const ridge = [[baseline, y(ordered[0].high)]];
-    ordered.forEach((row, index) => {
-      if (index > 0) {
-        const gapTop = y(ordered[index - 1].low);
-        const gapBottom = y(row.high);
-        if (gapBottom - gapTop > 1.25) {
-          ridge.push([baseline, gapTop]);
-          ridge.push([baseline, gapBottom]);
-        }
-      }
-      const xOut = reach(row);
-      ridge.push([xOut, y(row.high)]);
-      ridge.push([xOut, y(row.low)]);
-    });
-    ridge.push([baseline, y(ordered[ordered.length - 1].low)]);
-    const ridgeD = ridge.map((point, index) => `${index ? "L" : "M"}${point[0].toFixed(1)},${point[1].toFixed(1)}`).join(" ");
+  const orderedFlow = [...flow].sort((left, right) => right.high - left.high);
+  const orderedBook = [...bookRows].sort((left, right) => right.high - left.high);
+  const flowMax = orderedFlow.length ? Math.max(...orderedFlow.map((row) => row.notional)) : 1;
+  const bookMax = orderedBook.length ? Math.max(...orderedBook.map((row) => row.notional)) : 1;
+  const flowReach = (row) => baseline + 4 + (row.notional / flowMax) * (heatW - 14);
+  const bookReach = (row) => baseline + 4 + (row.notional / bookMax) * (heatW - 14);
+  if (orderedFlow.length) {
+    const ridgeD = mountainPath(orderedFlow, y, flowReach, baseline);
     const gradientId = `orders-${coin.base}-${mode}`;
     body += `<defs><linearGradient id="${gradientId}" gradientUnits="userSpaceOnUse" x1="${baseline.toFixed(1)}" y1="0" x2="${(baseline + heatW).toFixed(1)}" y2="0"><stop offset="0%" stop-color="rgb(243,209,90)"/><stop offset="52%" stop-color="rgb(226,74,42)"/><stop offset="100%" stop-color="rgb(110,24,20)"/></linearGradient></defs>`;
     body += `<path d="${ridgeD} Z" fill="url(#${gradientId})" opacity="0.94"/>`;
     body += `<path d="${ridgeD}" fill="none" stroke="rgba(255,236,214,0.82)" stroke-width="${expanded ? 1.7 : 1.35}" stroke-linejoin="round" stroke-linecap="round"/>`;
-    body += `<g id="heat-hover"></g>`;
   }
+  if (orderedBook.length) {
+    const ridgeD = mountainPath(orderedBook, y, bookReach, baseline);
+    body += `<path d="${ridgeD} Z" fill="rgba(230,177,92,0.28)"/>`;
+    body += `<path d="${ridgeD}" fill="none" stroke="rgba(230,177,92,0.9)" stroke-width="${expanded ? 1.5 : 1.2}" stroke-linejoin="round" stroke-linecap="round"/>`;
+  }
+  if (expanded) body += `<g id="heat-hover-dialog"></g>`;
 
-  const lastY = y(view.last == null ? candles[candles.length - 1].c : candles[candles.length - 1].c);
+  const lastClose = candles.length ? candles[candles.length - 1].c : view.last;
+  const lastY = y(lastClose);
   if (lastY >= pad.t && lastY <= axisY) {
     body += `<line x1="${pad.l}" y1="${lastY.toFixed(1)}" x2="${(heatX + heatW - 6).toFixed(1)}" y2="${lastY.toFixed(1)}" stroke="#e6b15c" stroke-dasharray="4 4" stroke-width="1"/>`;
   }
   body += `</g>`;
 
   const detailX = heatX + heatW + 8;
-  const peaks = orderPeaks(rows)
-    .map((row) => ({
-      row,
-      tipX: reach(row),
-      midY: (y(row.high) + y(row.low)) / 2,
-    }))
-    .filter((peak) => peak.midY > pad.t + 10 && peak.midY < axisY - 8)
-    .sort((left, right) => right.row.notional - left.row.notional);
-  const limit = expanded ? 6 : 3;
+  const peakSets = [
+    [orderedFlow, flowReach],
+    [orderedBook, bookReach],
+  ];
+  const peaks = [];
+  for (const [series, reach] of peakSets) {
+    for (const row of orderPeaks(series)) {
+      const midY = (y(row.high) + y(row.low)) / 2;
+      if (midY <= pad.t + 10 || midY >= axisY - 8) continue;
+      peaks.push({ row, tipX: reach(row), midY });
+    }
+  }
+  peaks.sort((left, right) => right.row.notional - left.row.notional);
+  const limit = expanded ? 5 : 3;
   const labeled = [];
+  const labelGap = expanded ? 64 : 58;
   for (const peak of peaks) {
     if (labeled.length >= limit) break;
-    if (labeled.some((item) => Math.abs(item.midY - peak.midY) < (expanded ? 22 : 18))) continue;
+    if (labeled.some((item) => Math.abs(item.midY - peak.midY) < labelGap)) continue;
     labeled.push(peak);
   }
+  const flowFont = expanded ? 24 : 22;
+  const sizeFont = expanded ? 20 : 18;
   for (const peak of labeled) {
-    const textY = peak.midY + 4;
     const volume = formatQuote(peak.row.notional);
     const price = formatPrice(peak.row.price, coin.price);
-    const extra = expanded ? ` ${sideWord(peak.row.side)}` : "";
-    body += `<circle cx="${peak.tipX.toFixed(1)}" cy="${peak.midY.toFixed(1)}" r="${expanded ? 3 : 2.2}" fill="#f4f1e8"/>`;
-    body += `<text x="${detailX.toFixed(1)}" y="${textY.toFixed(1)}" fill="#f4f1e8" font-size="${expanded ? 12 : 10}">${esc(price)} · ${esc(volume)}${esc(extra)}</text>`;
+    const side = sideWord(peak.row.side);
+    body += `<circle cx="${peak.tipX.toFixed(1)}" cy="${peak.midY.toFixed(1)}" r="${expanded ? 4.2 : 3.4}" fill="#f4f1e8"/>`;
+    body += `<text x="${detailX.toFixed(1)}" y="${(peak.midY - 4).toFixed(1)}" fill="#f4f1e8" font-size="${flowFont}" font-weight="560">${esc(price)}</text>`;
+    body += `<text x="${detailX.toFixed(1)}" y="${(peak.midY + sizeFont).toFixed(1)}" fill="#f4f1e8" font-size="${sizeFont}" font-weight="560">${esc(volume)} ${esc(side)}</text>`;
   }
 
   body += `<line x1="${pad.l}" y1="${axisY}" x2="${candleRight}" y2="${axisY}" stroke="rgba(244,241,232,0.28)"/>`;
   for (let tick = 0; tick < 4; tick += 1) {
-    const index = tick === 3 ? candles.length - 1 : Math.round((candles.length - 1) * (tick / 3));
-    const tickX = x(index);
+    const index = Math.round(start + (span - 1) * (tick / 3));
+    const candle = candles[Math.max(0, Math.min(candles.length - 1, index))];
+    if (!candle) continue;
+    const tickX = x(Math.max(0, Math.min(candles.length - 1, index)));
     const anchor = tick === 0 ? "start" : tick === 3 ? "end" : "middle";
     body += `<line x1="${tickX.toFixed(1)}" y1="${axisY}" x2="${tickX.toFixed(1)}" y2="${axisY + 5}" stroke="rgba(244,241,232,0.4)"/>`;
-    body += `<text x="${tickX.toFixed(1)}" y="${axisY + 18}" text-anchor="${anchor}" fill="#c4bfb2" font-size="11">${esc(formatAxisTime(candles[index].t))}</text>`;
+    const axisInterval = expanded ? activeInterval(coin) : "4h";
+    body += `<text x="${tickX.toFixed(1)}" y="${axisY + 18}" text-anchor="${anchor}" fill="#c4bfb2" font-size="12">${esc(formatAxisTime(candle.t, axisInterval))}</text>`;
   }
   const label = expanded
-    ? `role="img" aria-label="Expanded 4 hour ${esc(coin.base)} chart. Orders use the same price scale as the candles. Yellow is smaller size and dark red is larger."`
+    ? `role="img" aria-label="Expanded ${esc(frameLabel(activeInterval(coin)))} ${esc(coin.base)} chart. Drag to move through price and time. Pinch to zoom. Order flow uses this timeframe."`
     : `aria-hidden="true"`;
   const svg = `<svg class="plot" viewBox="0 0 ${width} ${height}" ${label}>${body}</svg>`;
   return {
@@ -366,9 +755,12 @@ function renderChart(coin, view, mode) {
       padT: pad.t,
       padL: pad.l,
       plotH,
+      plotW,
+      start,
+      end,
       min: view.min,
       max: view.max,
-      rows: ordered,
+      rows: [...orderedFlow, ...orderedBook],
     },
   };
 }
@@ -380,11 +772,11 @@ function orderChart(coin) {
   const view = { min: bounds.fullMin, max: bounds.fullMax, last: bounds.last };
   const drawn = renderChart(coin, view, "preview");
   const note = coin.market === "etf"
-    ? "Traded volume across this fund's full 4h range. Peaks show price and dollar size. Expand to scroll and zoom."
-    : "Order flow covers this full 4h range. Peaks show price and dollar size. Expand to zoom into the resting book.";
+    ? "Traded volume across this range. Expand to scroll earlier candles, including past the loaded edge."
+    : "Order flow covers prices above and below the last trade. Expand to scroll earlier candles and the resting book.";
   return `
     <div class="chart">
-      <button type="button" class="chart-open" data-base="${esc(coin.base)}" aria-label="Expand the ${esc(coin.name)} 4 hour chart">
+      <button type="button" class="chart-open" data-base="${esc(coin.base)}" aria-label="Expand the ${esc(coin.name)} chart">
         <span class="expand-label">Expand</span>
         ${drawn.markup}
       </button>
@@ -405,33 +797,79 @@ function findSectionCoin(base) {
   return (state.data?.coins || []).find((coin) => coin.base === base || coin.etf?.base === base);
 }
 
+function liveCoin(coin) {
+  for (const item of state.data?.coins || []) {
+    if (item.symbol === coin.symbol && (item.market || "spot") === (coin.market || "spot") && !item.error) return item;
+    const etf = item.etf;
+    if (etf?.symbol === coin.symbol && etf.market === coin.market && etf.available !== false && !etf.error) return etf;
+  }
+  return coin;
+}
+
+function scheduleDraw() {
+  if (drawQueued) return;
+  drawQueued = true;
+  requestAnimationFrame(() => {
+    drawQueued = false;
+    if (state.expanded) drawDialog();
+  });
+}
+
 function drawDialog() {
   const dialog = document.querySelector("#chart-dialog");
   const open = state.expanded;
   const coin = open && findCoin(open.base);
   if (!coin) return;
-  const bounds = chartBounds(coin);
-  const view = clampWindow(open.min, open.max, bounds);
-  open.min = view.min;
-  open.max = view.max;
-  view.last = bounds.last;
-  const drawn = renderChart(coin, view, "expanded");
-  open.geom = drawn.geom;
-  open.bounds = bounds;
+  const candles = historyCandles(coin);
+  const interval = open.interval || "4h";
+  dialog.querySelectorAll("[data-tf]").forEach((button) => {
+    button.setAttribute("aria-pressed", button.dataset.tf === interval ? "true" : "false");
+  });
   dialog.querySelector("#dialog-base").textContent = coin.base;
-  dialog.querySelector("#dialog-title").textContent = `${coin.name} · 4 hour`;
+  dialog.querySelector("#dialog-title").textContent = `${coin.name} · ${frameLabel(interval)}`;
+  if (!candles.length) {
+    open.geom = null;
+    dialog.querySelector("#dialog-stage").innerHTML = `<p class="chart-wait">${open.loading ? "Loading candles…" : "No candles for this timeframe."}</p>`;
+    dialog.querySelector("#dialog-range").textContent = open.loading ? "Loading candles…" : "No candles for this timeframe.";
+    return;
+  }
+  const time = fitTime(open.start, open.end, candles.length);
+  const price = fitPrice(open.min, open.max, coin, loadedExtent(coin));
+  open.start = time.start;
+  open.end = time.end;
+  open.min = price.min;
+  open.max = price.max;
+  const drawn = renderChart(coin, { min: open.min, max: open.max, start: open.start, end: open.end }, "expanded");
+  open.geom = drawn.geom;
   dialog.querySelector("#dialog-stage").innerHTML = drawn.markup;
-  const low = formatPrice(view.min, coin.price);
-  const high = formatPrice(view.max, coin.price);
-  dialog.querySelector("#dialog-range").textContent = `${low} – ${high}`;
+  const first = candles[Math.max(0, Math.min(candles.length - 1, Math.floor(open.start)))];
+  const last = candles[Math.max(0, Math.min(candles.length - 1, Math.ceil(open.end) - 1))];
+  const when = first && last ? `${formatAxisTime(first.t, interval)} – ${formatAxisTime(last.t, interval)} · ` : "";
+  const low = formatPrice(open.min, coin.price);
+  const high = formatPrice(open.max, coin.price);
+  const status = open.loading ? " · loading earlier candles" : open.exhausted && open.start < 1 ? " · no earlier candles" : "";
+  dialog.querySelector("#dialog-range").textContent = `${when}${low} – ${high}${status}`;
 }
 
 function openChart(base) {
   const coin = findCoin(base);
-  if (!coin) return;
-  const bounds = chartBounds(coin);
-  const view = focusWindow(bounds);
-  state.expanded = { base, min: view.min, max: view.max, drag: null };
+  if (!coin || !historyCandles(coin).length) return;
+  const home = expandedHome(coin);
+  pointers.clear();
+  state.expanded = {
+    base,
+    market: coin.market || "spot",
+    interval: "4h",
+    min: home.min,
+    max: home.max,
+    start: home.start,
+    end: home.end,
+    drag: null,
+    pinch: null,
+    loading: false,
+    exhausted: false,
+    pages: 0,
+  };
   drawDialog();
   const dialog = document.querySelector("#chart-dialog");
   if (!dialog.open) dialog.showModal();
@@ -440,7 +878,9 @@ function openChart(base) {
 
 function closeChart() {
   hideTip();
+  pointers.clear();
   const dialog = document.querySelector("#chart-dialog");
+  dialog.classList.remove("dragging");
   if (dialog.open) dialog.close();
 }
 
@@ -449,42 +889,260 @@ function hideTip() {
   if (tip) tip.hidden = true;
 }
 
-function zoomChart(factor, clientY) {
+function zoomChart(factor, clientX, clientY) {
   const open = state.expanded;
-  if (!open) return;
-  const span = open.max - open.min;
-  let anchor = (open.min + open.max) / 2;
-  if (clientY != null && open.geom) {
-    const svg = document.querySelector("#dialog-stage svg");
+  const coin = open && findCoin(open.base);
+  if (!open || !coin || !open.geom) return;
+  const priceSpan = open.max - open.min;
+  const timeSpan = open.end - open.start;
+  let priceAnchor = (open.min + open.max) / 2;
+  let timeAnchor = (open.start + open.end) / 2;
+  const svg = document.querySelector("#dialog-stage svg");
+  if (svg) {
     const rect = svg.getBoundingClientRect();
-    const y = ((clientY - rect.top) / rect.height) * open.geom.height;
-    const ratio = (y - open.geom.padT) / open.geom.plotH;
-    anchor = open.max - ratio * span;
+    if (clientY != null) {
+      const y = ((clientY - rect.top) / rect.height) * open.geom.height;
+      const ratio = (y - open.geom.padT) / open.geom.plotH;
+      priceAnchor = open.max - ratio * priceSpan;
+    }
+    if (clientX != null) {
+      const x = ((clientX - rect.left) / rect.width) * open.geom.width;
+      const ratio = (x - open.geom.padL) / (open.geom.plotW || 1);
+      timeAnchor = open.start + ratio * timeSpan;
+    }
   }
-  const nextSpan = span * factor;
-  const lowerRatio = (anchor - open.min) / (span || 1);
-  const next = clampWindow(anchor - nextSpan * lowerRatio, anchor + nextSpan * (1 - lowerRatio), open.bounds);
-  open.min = next.min;
-  open.max = next.max;
-  drawDialog();
+  const nextPrice = priceSpan * factor;
+  const lower = (priceAnchor - open.min) / (priceSpan || 1);
+  const price = fitPrice(
+    priceAnchor - nextPrice * lower,
+    priceAnchor + nextPrice * (1 - lower),
+    coin,
+    loadedExtent(coin),
+  );
+  const nextTime = timeSpan * factor;
+  const left = (timeAnchor - open.start) / (timeSpan || 1);
+  const time = fitTime(
+    timeAnchor - nextTime * left,
+    timeAnchor + nextTime * (1 - left),
+    historyCandles(coin).length,
+  );
+  open.min = price.min;
+  open.max = price.max;
+  open.start = time.start;
+  open.end = time.end;
+  scheduleDraw();
+  requestOlderIfNeeded();
 }
 
 function panChart(deltaPrice) {
   const open = state.expanded;
-  if (!open) return;
-  const next = clampWindow(open.min + deltaPrice, open.max + deltaPrice, open.bounds);
+  const coin = open && findCoin(open.base);
+  if (!open || !coin) return;
+  const next = fitPrice(open.min + deltaPrice, open.max + deltaPrice, coin, loadedExtent(coin));
   open.min = next.min;
   open.max = next.max;
-  drawDialog();
+  scheduleDraw();
+  requestOlderIfNeeded();
 }
 
-function priceDeltaFromPixels(pixels) {
+function panTime(deltaIndex) {
+  const open = state.expanded;
+  const coin = open && findCoin(open.base);
+  if (!open || !coin) return;
+  const next = fitTime(open.start + deltaIndex, open.end + deltaIndex, historyCandles(coin).length);
+  open.start = next.start;
+  open.end = next.end;
+  scheduleDraw();
+  requestOlderIfNeeded();
+}
+
+function priceDeltaFromPixels(pixels, span) {
   const open = state.expanded;
   const svg = document.querySelector("#dialog-stage svg");
-  if (!open || !svg) return 0;
+  if (!open?.geom || !svg) return 0;
   const rect = svg.getBoundingClientRect();
-  const span = open.max - open.min;
-  return (pixels / rect.height) * span * (open.geom.height / open.geom.plotH);
+  const used = span == null ? open.max - open.min : span;
+  return (pixels / rect.height) * used * (open.geom.height / open.geom.plotH);
+}
+
+function indexDeltaFromPixels(pixels, span) {
+  const open = state.expanded;
+  const svg = document.querySelector("#dialog-stage svg");
+  if (!open?.geom || !svg) return 0;
+  const rect = svg.getBoundingClientRect();
+  const used = span == null ? open.end - open.start : span;
+  return (pixels / rect.width) * used * (open.geom.width / (open.geom.plotW || 1));
+}
+
+function applyDrag(event) {
+  const open = state.expanded;
+  const drag = open?.drag;
+  const coin = open && findCoin(open.base);
+  if (!drag || !coin) return;
+  const price = fitPrice(
+    drag.min + priceDeltaFromPixels(event.clientY - drag.y, drag.max - drag.min),
+    drag.max + priceDeltaFromPixels(event.clientY - drag.y, drag.max - drag.min),
+    coin,
+    loadedExtent(coin),
+  );
+  const dIndex = -indexDeltaFromPixels(event.clientX - drag.x, drag.end - drag.start);
+  const time = fitTime(drag.start + dIndex, drag.end + dIndex, historyCandles(coin).length);
+  open.min = price.min;
+  open.max = price.max;
+  open.start = time.start;
+  open.end = time.end;
+  scheduleDraw();
+  requestOlderIfNeeded();
+}
+
+function applyPinch() {
+  const open = state.expanded;
+  const pinch = open?.pinch;
+  if (!pinch || pointers.size < 2) return;
+  const pts = [...pointers.values()];
+  const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y) || 1;
+  const factor = Math.min(4, Math.max(0.25, pinch.dist / Math.max(dist, 12)));
+  open.min = pinch.min;
+  open.max = pinch.max;
+  open.start = pinch.start;
+  open.end = pinch.end;
+  zoomChart(factor, (pts[0].x + pts[1].x) / 2, (pts[0].y + pts[1].y) / 2);
+}
+
+function beyondLoadedPrice(open, extent) {
+  if (!extent) return false;
+  const span = Math.max(extent.max - extent.min, Math.abs(extent.max) * 0.001);
+  const margin = span * 0.08;
+  return open.min < extent.min - margin || open.max > extent.max + margin;
+}
+
+function requestOlderIfNeeded() {
+  const open = state.expanded;
+  if (!open || open.loading || open.exhausted) return;
+  const coin = findCoin(open.base);
+  if (!coin) return;
+  const candles = historyCandles(coin);
+  const timeEdge = open.start < 2;
+  const priceEdge = beyondLoadedPrice(open, candleExtent(candles));
+  if (!timeEdge && !priceEdge) {
+    open.pages = 0;
+    return;
+  }
+  if ((open.pages || 0) >= 8) return;
+  clearTimeout(open.olderTimer);
+  open.olderTimer = setTimeout(() => loadOlder(), 160);
+}
+
+async function loadOlder() {
+  const open = state.expanded;
+  if (!open || open.loading || open.exhausted) return;
+  const coin = findCoin(open.base);
+  if (!coin) return;
+  const candles = historyCandles(coin);
+  if (!candles.length) return;
+  const timeEdge = open.start < 2;
+  const priceEdge = beyondLoadedPrice(open, candleExtent(candles));
+  if (!timeEdge && !priceEdge) return;
+  open.loading = true;
+  open.pages = (open.pages || 0) + 1;
+  scheduleDraw();
+  const end = candles[0].t;
+  const interval = open.interval || "4h";
+  const market = coin.market === "etf" ? "etf" : "spot";
+  try {
+    const response = await fetch(`/api/history?symbol=${encodeURIComponent(coin.symbol)}&market=${market}&interval=${encodeURIComponent(interval)}&end=${end}&limit=500`);
+    if (!response.ok) throw new Error("history");
+    const payload = await response.json();
+    if (state.expanded !== open || (open.interval || "4h") !== interval) return;
+    const current = findCoin(open.base) || coin;
+    const existing = frameCandles(current, interval);
+    const seen = new Set(existing.map((candle) => candle.t));
+    const older = (payload.candles || [])
+      .filter((candle) => candle.t < end && !seen.has(candle.t))
+      .sort((left, right) => left.t - right.t);
+    if (!older.length) {
+      open.exhausted = true;
+      return;
+    }
+    const merged = mergeHistory(older, existing);
+    const added = merged.findIndex((candle) => candle.t === existing[0].t);
+    current.chart.frames = current.chart.frames || {};
+    current.chart.frames[interval] = merged;
+    if (interval === "4h") current.chart.history = merged;
+    delete current.chart._flow;
+    delete current.chart._swings;
+    if (state.expanded === open && added > 0) {
+      open.start += added;
+      open.end += added;
+      if (open.drag) {
+        open.drag.start += added;
+        open.drag.end += added;
+      }
+      if (open.pinch) {
+        open.pinch.start += added;
+        open.pinch.end += added;
+      }
+    }
+  } catch (_error) {
+    open.pages = Math.max(0, (open.pages || 1) - 1);
+    return;
+  } finally {
+    open.loading = false;
+    if (state.expanded === open) scheduleDraw();
+  }
+  if (state.expanded === open) requestOlderIfNeeded();
+}
+
+async function fetchLatestFrame(coin, interval) {
+  const market = coin.market === "etf" ? "etf" : "spot";
+  const response = await fetch(`/api/history?symbol=${encodeURIComponent(coin.symbol)}&market=${market}&interval=${encodeURIComponent(interval)}&limit=1000`);
+  if (!response.ok) throw new Error("history");
+  const payload = await response.json();
+  const candles = (payload.candles || []).slice().sort((left, right) => left.t - right.t);
+  const target = liveCoin(coin);
+  const chart = target.chart || (target.chart = {});
+  chart.frames = chart.frames || {};
+  chart.frames[interval] = candles;
+  if (interval === "4h") chart.history = candles;
+  delete chart._flow;
+  delete chart._swings;
+  return candles;
+}
+
+async function setTimeframe(interval) {
+  const open = state.expanded;
+  const coin = open && findCoin(open.base);
+  if (!open || !coin || (open.interval || "4h") === interval) return;
+  open.interval = interval;
+  open.exhausted = false;
+  open.pages = 0;
+  open.drag = null;
+  open.pinch = null;
+  pointers.clear();
+  const token = (open.fetchToken || 0) + 1;
+  open.fetchToken = token;
+  let candles = frameCandles(coin, interval);
+  if (!candles.length) {
+    open.loading = true;
+    drawDialog();
+    try {
+      candles = await fetchLatestFrame(coin, interval);
+    } catch (_error) {
+      candles = [];
+    }
+    if (state.expanded !== open || open.fetchToken !== token) return;
+    open.loading = false;
+  }
+  if (!candles.length) {
+    drawDialog();
+    return;
+  }
+  const home = expandedHome(findCoin(open.base) || coin);
+  open.start = home.start;
+  open.end = home.end;
+  open.min = home.min;
+  open.max = home.max;
+  drawDialog();
 }
 
 function pointerPrice(event) {
@@ -501,10 +1159,11 @@ function pointerPrice(event) {
 function showTip(event) {
   const open = state.expanded;
   const tip = document.querySelector("#dialog-tip");
-  const hover = document.querySelector("#heat-hover");
+  const hover = document.querySelector("#heat-hover-dialog");
   if (!open?.geom || !tip) return;
   const price = pointerPrice(event);
-  const row = price == null ? null : open.geom.rows.find((item) => price <= item.high && price >= item.low);
+  const matches = price == null ? [] : open.geom.rows.filter((item) => price <= item.high && price >= item.low);
+  const row = matches.sort((left, right) => (left.high - left.low) - (right.high - right.low))[0] || null;
   if (!row || !hover) {
     tip.hidden = true;
     if (hover) hover.innerHTML = "";
@@ -536,6 +1195,11 @@ function bindChartDialog() {
       closeChart();
       return;
     }
+    const tf = event.target.closest("[data-tf]")?.dataset.tf;
+    if (tf && state.expanded) {
+      setTimeframe(tf);
+      return;
+    }
     const act = event.target.closest("[data-act]")?.dataset.act;
     if (!act || !state.expanded) return;
     if (act === "close") closeChart();
@@ -543,46 +1207,92 @@ function bindChartDialog() {
     if (act === "out") zoomChart(1.4);
     if (act === "reset") {
       const coin = findCoin(state.expanded.base);
-      const view = focusWindow(chartBounds(coin));
-      state.expanded.min = view.min;
-      state.expanded.max = view.max;
+      const home = expandedHome(coin);
+      state.expanded.min = home.min;
+      state.expanded.max = home.max;
+      state.expanded.start = home.start;
+      state.expanded.end = home.end;
+      state.expanded.exhausted = false;
+      state.expanded.pages = 0;
       drawDialog();
     }
   });
   dialog.addEventListener("wheel", (event) => {
     if (!state.expanded || !event.target.closest("#dialog-stage")) return;
     event.preventDefault();
-    if (event.ctrlKey || event.metaKey) zoomChart(event.deltaY > 0 ? 1.12 : 0.88, event.clientY);
-    else panChart(-priceDeltaFromPixels(event.deltaY));
+    if (event.ctrlKey || event.metaKey) zoomChart(event.deltaY > 0 ? 1.12 : 0.88, event.clientX, event.clientY);
+    else {
+      if (event.deltaX) panTime(-indexDeltaFromPixels(event.deltaX));
+      if (event.deltaY) panChart(-priceDeltaFromPixels(event.deltaY));
+    }
+  }, { passive: false });
+  dialog.querySelector("#dialog-stage").addEventListener("touchmove", (event) => {
+    if (state.expanded && event.cancelable) event.preventDefault();
   }, { passive: false });
   dialog.addEventListener("pointerdown", (event) => {
-    if (!state.expanded || event.button !== 0 || !event.target.closest("#dialog-stage svg")) return;
-    state.expanded.drag = { y: event.clientY, min: state.expanded.min, max: state.expanded.max };
+    if (!state.expanded || event.button !== 0 || !event.target.closest("#dialog-stage")) return;
+    if (event.cancelable) event.preventDefault();
+    pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    try { dialog.setPointerCapture(event.pointerId); } catch (_error) { /* The move events still reach the dialog. */ }
     dialog.classList.add("dragging");
-    dialog.setPointerCapture(event.pointerId);
-  });
-  dialog.addEventListener("pointermove", (event) => {
-    const drag = state.expanded?.drag;
-    if (!drag) {
-      if (state.expanded && event.target.closest("#dialog-stage")) showTip(event);
-      else hideTip();
+    state.expanded.pages = 0;
+    hideTip();
+    if (pointers.size >= 2) {
+      const pts = [...pointers.values()];
+      state.expanded.drag = null;
+      state.expanded.pinch = {
+        dist: Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y) || 1,
+        min: state.expanded.min,
+        max: state.expanded.max,
+        start: state.expanded.start,
+        end: state.expanded.end,
+      };
       return;
     }
-    hideTip();
-    const delta = priceDeltaFromPixels(event.clientY - drag.y);
-    const next = clampWindow(drag.min + delta, drag.max + delta, state.expanded.bounds);
-    state.expanded.min = next.min;
-    state.expanded.max = next.max;
-    drawDialog();
-    state.expanded.drag = drag;
+    state.expanded.pinch = null;
+    state.expanded.drag = {
+      x: event.clientX,
+      y: event.clientY,
+      min: state.expanded.min,
+      max: state.expanded.max,
+      start: state.expanded.start,
+      end: state.expanded.end,
+    };
   });
-  const endDrag = () => {
+  dialog.addEventListener("pointermove", (event) => {
+    if (pointers.has(event.pointerId)) {
+      if (event.cancelable) event.preventDefault();
+      pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      if (pointers.size >= 2 && state.expanded?.pinch) applyPinch();
+      else if (state.expanded?.drag) applyDrag(event);
+      return;
+    }
+    if (state.expanded && event.target.closest("#dialog-stage")) showTip(event);
+    else hideTip();
+  }, { passive: false });
+  const endPointer = (event) => {
     if (!state.expanded) return;
+    pointers.delete(event.pointerId);
+    if (pointers.size >= 2) return;
+    state.expanded.pinch = null;
+    if (pointers.size === 1) {
+      const remaining = [...pointers.values()][0];
+      state.expanded.drag = {
+        x: remaining.x,
+        y: remaining.y,
+        min: state.expanded.min,
+        max: state.expanded.max,
+        start: state.expanded.start,
+        end: state.expanded.end,
+      };
+      return;
+    }
     state.expanded.drag = null;
     dialog.classList.remove("dragging");
+    requestOlderIfNeeded();
   };
-  dialog.addEventListener("pointerup", endDrag);
-  dialog.addEventListener("pointercancel", endDrag);
+  dialog.addEventListener("pointerup", endPointer);
+  dialog.addEventListener("pointercancel", endPointer);
   document.addEventListener("keydown", (event) => {
     if (!state.expanded || event.key !== "Escape") return;
     event.preventDefault();
@@ -596,6 +1306,12 @@ function bindChartDialog() {
     } else if (event.key === "ArrowDown") {
       event.preventDefault();
       panChart(priceDeltaFromPixels(48));
+    } else if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      panTime(-indexDeltaFromPixels(72));
+    } else if (event.key === "ArrowRight") {
+      event.preventDefault();
+      panTime(indexDeltaFromPixels(72));
     } else if (event.key === "+" || event.key === "=") {
       event.preventDefault();
       zoomChart(0.8);
@@ -774,6 +1490,7 @@ async function load(refresh) {
       throw new Error(body.detail || `Request failed (${response.status})`);
     }
     const incoming = await response.json();
+    carryCharts(state.data, incoming);
     const unchanged = state.data
       && state.data.generated_at === incoming.generated_at
       && Boolean(state.data.stale) === Boolean(incoming.stale)
