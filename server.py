@@ -52,6 +52,17 @@ TIMEFRAMES = (
     ("1d", "1D"),
 )
 
+# Largest US spot fund for each coin that has one. Tickers checked against Yahoo.
+ETFS = {
+    "BTC": ("IBIT", "iShares Bitcoin Trust"),
+    "ETH": ("ETHA", "iShares Ethereum Trust"),
+    "SOL": ("BSOL", "Bitwise Solana ETF"),
+    "XRP": ("XRP", "Bitwise XRP ETF"),
+    "BNB": ("VBNB", "VanEck BNB ETF"),
+    "DOGE": ("GDOG", "Grayscale Dogecoin Trust"),
+}
+YAHOO = "https://query1.finance.yahoo.com/v8/finance/chart"
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("flowdesk")
 
@@ -165,6 +176,195 @@ async def build_coin(client: httpx.AsyncClient, sem: asyncio.Semaphore, spec: tu
         return {"symbol": symbol, "base": base, "name": name, "error": str(exc)}
 
 
+def parse_yahoo_candles(result: dict) -> list[dict]:
+    timestamps = result.get("timestamp") or []
+    quote = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+    opens = quote.get("open") or []
+    highs = quote.get("high") or []
+    lows = quote.get("low") or []
+    closes = quote.get("close") or []
+    volumes = quote.get("volume") or []
+    candles = []
+    for index, ts in enumerate(timestamps):
+        if index >= len(opens) or None in (opens[index], highs[index], lows[index], closes[index]):
+            continue
+        price = float(closes[index])
+        dollar_volume = price * float(volumes[index] or 0)
+        candles.append(
+            {
+                "t": int(ts) * 1000,
+                "o": float(opens[index]),
+                "h": float(highs[index]),
+                "l": float(lows[index]),
+                "c": price,
+                "quote_volume": dollar_volume,
+                # Share volume is not split into buyer and seller, so the line stays unsigned.
+                "taker_buy_quote": dollar_volume / 2,
+            }
+        )
+    return candles
+
+
+def aggregate_candles(candles: list[dict], bucket_ms: int) -> list[dict]:
+    grouped: dict[int, list[dict]] = {}
+    order: list[int] = []
+    for candle in candles:
+        key = candle["t"] // bucket_ms
+        bucket = grouped.get(key)
+        if bucket is None:
+            grouped[key] = [candle]
+            order.append(key)
+        else:
+            bucket.append(candle)
+    merged = []
+    for key in order:
+        rows = grouped[key]
+        merged.append(
+            {
+                "t": rows[0]["t"],
+                "o": rows[0]["o"],
+                "h": max(row["h"] for row in rows),
+                "l": min(row["l"] for row in rows),
+                "c": rows[-1]["c"],
+                "quote_volume": sum(row["quote_volume"] for row in rows),
+                "taker_buy_quote": sum(row["taker_buy_quote"] for row in rows),
+            }
+        )
+    return merged
+
+
+async def fetch_yahoo(client: httpx.AsyncClient, sem: asyncio.Semaphore, symbol: str, interval: str, span: str) -> dict:
+    delay = 0.4
+    response = None
+    async with sem:
+        for _attempt in range(3):
+            response = await client.get(
+                f"/{symbol}",
+                params={"interval": interval, "range": span, "includePrePost": "false"},
+            )
+            if response.status_code in {418, 429, 500, 502, 503}:
+                await asyncio.sleep(delay)
+                delay *= 2
+                continue
+            response.raise_for_status()
+            payload = response.json()
+            chart = payload.get("chart") or {}
+            if chart.get("error"):
+                message = chart["error"].get("description") or f"{symbol} chart failed"
+                raise RuntimeError(message)
+            result = (chart.get("result") or [None])[0]
+            if not result:
+                raise RuntimeError(f"{symbol} returned no candles")
+            return result
+    if response is not None:
+        response.raise_for_status()
+    raise RuntimeError(f"{symbol} chart failed")
+
+
+def etf_quote(meta: dict, daily_candles: list[dict]) -> dict:
+    price = meta.get("regularMarketPrice")
+    if price is None and daily_candles:
+        price = daily_candles[-1]["c"]
+    change = None
+    if price is not None and len(daily_candles) >= 2 and daily_candles[-2]["c"]:
+        change = (float(price) - daily_candles[-2]["c"]) / daily_candles[-2]["c"] * 100
+    volume = meta.get("regularMarketVolume")
+    dollar_volume = None
+    if price is not None and volume is not None:
+        dollar_volume = float(price) * float(volume)
+    return {
+        "price": None if price is None else float(price),
+        "change_pct": change,
+        "quote_volume": dollar_volume,
+        "high": meta.get("regularMarketDayHigh"),
+        "low": meta.get("regularMarketDayLow"),
+        "name": meta.get("shortName") or meta.get("longName"),
+    }
+
+
+async def build_etf(client: httpx.AsyncClient, sem: asyncio.Semaphore, base: str, symbol: str, fallback_name: str) -> dict:
+    try:
+        intraday, hourly, daily = await asyncio.gather(
+            fetch_yahoo(client, sem, symbol, "15m", "60d"),
+            fetch_yahoo(client, sem, symbol, "60m", "1y"),
+            fetch_yahoo(client, sem, symbol, "1d", "2y"),
+        )
+        hourly_candles = parse_yahoo_candles(hourly)
+        daily_candles = parse_yahoo_candles(daily)
+        frames = {
+            "15m": parse_yahoo_candles(intraday)[-200:],
+            "1h": hourly_candles[-200:],
+            "4h": aggregate_candles(hourly_candles, 4 * 60 * 60 * 1000)[-200:],
+            "1D": daily_candles[-200:],
+        }
+        if any(len(frame) < 30 for frame in frames.values()):
+            raise RuntimeError("not enough trading history")
+        timeframes = [analyze_timeframe(frames[label], interval, label) for interval, label in TIMEFRAMES]
+        four_hour = next(timeframe for timeframe in timeframes if timeframe["interval"] == "4h")
+        quote = etf_quote(daily.get("meta") or {}, daily_candles)
+        price = quote["price"] if quote["price"] is not None else four_hour["candles"][-1]["c"]
+        empty_flow: dict = {}
+        empty_book: dict = {}
+        momentum = momentum_confidence(timeframes, empty_flow, empty_book, [])
+        return {
+            "available": True,
+            "symbol": symbol,
+            "base": symbol,
+            "name": quote["name"] or fallback_name,
+            "market": "etf",
+            "coin": base,
+            "price": round(price, 8),
+            "change_pct": None if quote["change_pct"] is None else round(quote["change_pct"], 4),
+            "quote_volume": None if quote["quote_volume"] is None else round(quote["quote_volume"], 2),
+            "high": None if quote["high"] is None else round(float(quote["high"]), 8),
+            "low": None if quote["low"] is None else round(float(quote["low"]), 8),
+            "alignment": alignment(timeframes),
+            "momentum": momentum,
+            "findings": compose_findings(quote["name"] or fallback_name, timeframes, empty_flow, empty_book, [], momentum),
+            "chart": {
+                "candles": four_hour["candles"],
+                "swings": four_hour["swings"],
+                "levels": four_hour["structure"]["levels"],
+                "heatmap": [],
+                "profile": [],
+                "flow": four_hour.get("order_flow") or [],
+            },
+        }
+    except Exception as exc:
+        log.warning("%s ETF %s failed: %s", base, symbol, exc)
+        return {
+            "available": True,
+            "symbol": symbol,
+            "base": symbol,
+            "name": fallback_name,
+            "market": "etf",
+            "coin": base,
+            "error": str(exc),
+        }
+
+
+def missing_etf(name: str) -> dict:
+    return {
+        "available": False,
+        "note": f"No US spot ETF is listed for {name}.",
+    }
+
+
+async def attach_etfs(coins: list) -> None:
+    timeout = httpx.Timeout(20.0, connect=10.0)
+    headers = {"User-Agent": "Mozilla/5.0"}
+    async with httpx.AsyncClient(base_url=YAHOO, timeout=timeout, headers=headers) as client:
+        sem = asyncio.Semaphore(4)
+        built = await asyncio.gather(
+            *(build_etf(client, sem, base, symbol, name) for base, (symbol, name) in ETFS.items())
+        )
+    by_coin = {payload["coin"]: payload for payload in built}
+    for coin in coins:
+        if coin.get("error"):
+            continue
+        coin["etf"] = by_coin.get(coin["base"]) or missing_etf(coin["name"])
+
+
 async def build_desk() -> dict:
     started = time.perf_counter()
     timeout = httpx.Timeout(20.0, connect=10.0)
@@ -175,9 +375,10 @@ async def build_desk() -> dict:
         except Exception as exc:
             log.warning("ticker request failed: %s", exc)
             tickers = {}
-        coins = await asyncio.gather(
-            *(build_coin(client, sem, spec, tickers.get(spec[0])) for spec in COINS)
+        coins = list(
+            await asyncio.gather(*(build_coin(client, sem, spec, tickers.get(spec[0])) for spec in COINS))
         )
+    await attach_etfs(coins)
     usable = [coin for coin in coins if not coin.get("error")]
     if not usable:
         raise RuntimeError(coins[0].get("error") if coins else "No market data returned")

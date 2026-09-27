@@ -228,7 +228,8 @@ function sideWord(side) {
 function renderChart(coin, view, mode) {
   const chart = coin.chart || {};
   const candles = chart.candles || [];
-  const rows = mode === "expanded" ? profileRows(coin) : flowRows(coin);
+  const bookRows = profileRows(coin);
+  const rows = mode === "expanded" && bookRows.length ? bookRows : flowRows(coin);
   const expanded = mode === "expanded";
   const width = expanded ? 1100 : 960;
   const height = expanded ? 640 : 400;
@@ -378,7 +379,9 @@ function orderChart(coin) {
   const bounds = chartBounds(coin);
   const view = { min: bounds.fullMin, max: bounds.fullMax, last: bounds.last };
   const drawn = renderChart(coin, view, "preview");
-  const note = "Order flow covers this full 4h range. Peaks show price and dollar size. Expand to zoom into the resting book.";
+  const note = coin.market === "etf"
+    ? "Traded volume across this fund's full 4h range. Peaks show price and dollar size. Expand to scroll and zoom."
+    : "Order flow covers this full 4h range. Peaks show price and dollar size. Expand to zoom into the resting book.";
   return `
     <div class="chart">
       <button type="button" class="chart-open" data-base="${esc(coin.base)}" aria-label="Expand the ${esc(coin.name)} 4 hour chart">
@@ -390,7 +393,16 @@ function orderChart(coin) {
 }
 
 function findCoin(base) {
-  return (state.data?.coins || []).find((coin) => coin.base === base && !coin.error);
+  for (const coin of state.data?.coins || []) {
+    if (coin.base === base && !coin.error) return coin;
+    const etf = coin.etf;
+    if (etf && etf.base === base && etf.available !== false && !etf.error) return etf;
+  }
+  return undefined;
+}
+
+function findSectionCoin(base) {
+  return (state.data?.coins || []).find((coin) => coin.base === base || coin.etf?.base === base);
 }
 
 function drawDialog() {
@@ -609,12 +621,12 @@ function momentumBox(momentum) {
     </aside>`;
 }
 
-function findingsBlock(text) {
+function findingsBlock(text, title = "What the data says") {
   const paragraphs = String(text || "").split(/\n\n+/).filter(Boolean);
   if (!paragraphs.length) return "";
   return `
     <section class="findings">
-      <h3>What the data says</h3>
+      <h3>${esc(title)}</h3>
       ${paragraphs.map((paragraph) => `<p>${esc(paragraph)}</p>`).join("")}
     </section>`;
 }
@@ -658,6 +670,58 @@ function coinSection(coin) {
         ${momentumBox(coin.momentum)}
       </div>
       ${findingsBlock(coin.findings)}
+      ${etfBlock(coin)}
+    </section>`;
+}
+
+function quoteLine(item) {
+  const change = item.change_pct;
+  const changeClass = change > 0 ? "up" : change < 0 ? "down" : "flat";
+  const changeText = change == null ? "—" : `${change > 0 ? "+" : ""}${change.toFixed(2)}%`;
+  const range = item.high == null ? "" : `session ${formatPrice(item.low, item.price)} – ${formatPrice(item.high, item.price)}`;
+  const volume = item.quote_volume == null ? "" : `${range ? " · " : ""}volume ${formatQuote(item.quote_volume)}`;
+  return { changeClass, changeText, stat: `${range}${volume}` };
+}
+
+function etfBlock(coin) {
+  const etf = coin.etf;
+  if (!etf || etf.available === false) {
+    const note = etf?.note || `No US spot ETF is listed for ${coin.name}.`;
+    return `
+      <section class="etf">
+        <h3>ETF</h3>
+        <p class="hint">${esc(note)}</p>
+      </section>`;
+  }
+  if (etf.error) {
+    return `
+      <section class="etf">
+        <h3>${esc(etf.base)}</h3>
+        <p class="narrative">${esc(etf.name)} did not load. ${esc(etf.error)}</p>
+      </section>`;
+  }
+  const quote = quoteLine(etf);
+  return `
+    <section class="etf">
+      <div class="coin-head">
+        <div class="ident">
+          <div class="base-row">
+            <p class="base">${esc(etf.base)}</p>
+            <span class="badge ${esc(etf.alignment.bias)}">${esc(etf.alignment.badge)}</span>
+          </div>
+          <p class="name">${esc(etf.name)}</p>
+        </div>
+        <div class="quote">
+          <p class="price etf-price">${esc(formatPrice(etf.price))}</p>
+          <p class="change ${quote.changeClass}">${esc(quote.changeText)}</p>
+          <p class="stat-line">${esc(quote.stat)}</p>
+        </div>
+      </div>
+      <div class="stage">
+        ${orderChart(etf)}
+        ${momentumBox(etf.momentum)}
+      </div>
+      ${findingsBlock(etf.findings, "What the ETF data says")}
     </section>`;
 }
 
@@ -678,8 +742,9 @@ function render(options = {}) {
   window.scrollTo(0, y);
   watchSections();
   if (state.expanded) {
-    const coin = findCoin(state.expanded.base);
-    if (coin && matches(coin)) drawDialog();
+    const subject = findCoin(state.expanded.base);
+    const section = findSectionCoin(state.expanded.base);
+    if (subject && section && matches(section)) drawDialog();
     else closeChart();
   }
 }

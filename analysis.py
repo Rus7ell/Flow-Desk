@@ -1125,7 +1125,7 @@ def momentum_confidence(timeframes: list[dict], flow: dict, book: dict, heatmap:
         return {
             "direction": "Unclear",
             "confidence": 0,
-            "reason": "There is not enough agreement between the book and the timeframes to lean either way.",
+            "reason": "There is not enough agreement across the timeframes to lean either way.",
         }
     weight_total = sum(signal[2] for signal in considered)
     bias = sum(signal[1] * signal[2] for signal in considered) / weight_total
@@ -1306,13 +1306,14 @@ def compose_findings(name: str, timeframes: list[dict], flow: dict, book: dict, 
             )
     lean = momentum.get("direction", "Unclear").lower()
     confidence = momentum.get("confidence", 0)
+    source = "the order book" if book.get("balance") or heatmap else "traded volume"
     if lean == "unclear":
         order_sentences.append(
-            f"Put together, the timeframes and the order book do not agree on a direction. Confidence is {confidence}."
+            f"Put together, the timeframes and {source} do not agree on a direction. Confidence is {confidence}."
         )
     else:
         order_sentences.append(
-            f"Put together, the timeframes and the order book lean {lean}. Confidence is {confidence}."
+            f"Put together, the timeframes and {source} lean {lean}. Confidence is {confidence}."
         )
     return " ".join(sentences) + "\n\n" + " ".join(order_sentences)
 
