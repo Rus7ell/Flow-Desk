@@ -322,7 +322,7 @@ function historyCandles(coin) {
 }
 
 function buildFlow(candles) {
-  const binCount = 72;
+  const binCount = 480;
   if (candles.length < 2) return [];
   let low = Infinity;
   let high = -Infinity;
@@ -353,7 +353,11 @@ function buildFlow(candles) {
       bins[index].sell += sell;
       continue;
     }
-    for (const item of bins) {
+    let first = Math.max(0, Math.floor((candleLow - low) / step));
+    let last = Math.min(binCount - 1, Math.floor((candleHigh - low) / step));
+    if (candleHigh <= bins[last].low && last > first) last -= 1;
+    for (let index = first; index <= last; index += 1) {
+      const item = bins[index];
       const overlap = Math.min(candleHigh, item.high) - Math.max(candleLow, item.low);
       if (overlap <= 0) continue;
       const share = overlap / candleSpan;
@@ -367,7 +371,7 @@ function buildFlow(candles) {
   const profile = [];
   for (const item of populated) {
     const notional = item.buy + item.sell;
-    if (notional < largest * 0.004) continue;
+    if (notional < largest * 0.0012) continue;
     let side = "mixed";
     if (item.buy > item.sell * 1.15) side = "buy";
     else if (item.sell > item.buy * 1.15) side = "sell";
@@ -541,27 +545,22 @@ function fitTime(start, end, length) {
 
 function expandedHome(coin) {
   const candles = historyCandles(coin);
-  const visible = Math.min(140, candles.length);
-  const start = Math.max(0, candles.length - visible);
+  const count = Math.min(36, candles.length);
+  const start = Math.max(0, candles.length - count);
   const end = candles.length;
-  const flow = ensureFlow(coin, candles);
   const book = profileRows(coin);
   const slice = candles.slice(start, end);
-  const highs = [
-    ...slice.map((candle) => candle.h),
-    ...flow.map((row) => row.high),
-    ...book.map((row) => row.high),
-  ];
-  const lows = [
-    ...slice.map((candle) => candle.l),
-    ...flow.map((row) => row.low),
-    ...book.map((row) => row.low),
-  ];
+  const highs = slice.map((candle) => candle.h);
+  const lows = slice.map((candle) => candle.l);
+  if (book.length) {
+    highs.push(...book.map((row) => row.high));
+    lows.push(...book.map((row) => row.low));
+  }
   let min = Math.min(...lows);
   let max = Math.max(...highs);
-  const span = max - min || Math.abs(max) || 1;
-  min -= span * 0.04;
-  max += span * 0.04;
+  const span = max - min || Math.abs(coin.price) * 0.01 || 1;
+  min -= span * 0.1;
+  max += span * 0.1;
   return { start, end, min, max };
 }
 
@@ -682,13 +681,24 @@ function renderChart(coin, view, mode) {
     const ridgeD = mountainPath(orderedFlow, y, flowReach, baseline);
     const gradientId = `orders-${coin.base}-${mode}`;
     body += `<defs><linearGradient id="${gradientId}" gradientUnits="userSpaceOnUse" x1="${baseline.toFixed(1)}" y1="0" x2="${(baseline + heatW).toFixed(1)}" y2="0"><stop offset="0%" stop-color="rgb(243,209,90)"/><stop offset="52%" stop-color="rgb(226,74,42)"/><stop offset="100%" stop-color="rgb(110,24,20)"/></linearGradient></defs>`;
-    body += `<path d="${ridgeD} Z" fill="url(#${gradientId})" opacity="0.94"/>`;
-    body += `<path d="${ridgeD}" fill="none" stroke="rgba(255,236,214,0.82)" stroke-width="${expanded ? 1.7 : 1.35}" stroke-linejoin="round" stroke-linecap="round"/>`;
+    body += `<path d="${ridgeD} Z" fill="url(#${gradientId})" opacity="${expanded ? 0.38 : 0.94}"/>`;
+    body += `<path d="${ridgeD}" fill="none" stroke="${expanded ? "rgba(255,236,214,0.45)" : "rgba(255,236,214,0.82)"}" stroke-width="1.35" stroke-linejoin="round" stroke-linecap="round"/>`;
   }
-  if (orderedBook.length) {
+  if (orderedBook.length && expanded) {
+    for (const row of orderedBook) {
+      const yHigh = y(row.high);
+      const yLow = y(row.low);
+      if (Math.max(yHigh, yLow) < pad.t - 6 || Math.min(yHigh, yLow) > axisY + 6) continue;
+      const natural = Math.abs(yLow - yHigh);
+      const barH = Math.max(natural, 1.15);
+      const top = Math.min(yHigh, yLow) - (barH - natural) / 2;
+      const barW = Math.max(4, bookReach(row) - baseline);
+      body += `<rect x="${baseline.toFixed(1)}" y="${top.toFixed(1)}" width="${barW.toFixed(1)}" height="${barH.toFixed(1)}" fill="rgba(243,209,90,0.94)" stroke="#fff6cf" stroke-width="0.7"/>`;
+    }
+  } else if (orderedBook.length) {
     const ridgeD = mountainPath(orderedBook, y, bookReach, baseline);
     body += `<path d="${ridgeD} Z" fill="rgba(230,177,92,0.28)"/>`;
-    body += `<path d="${ridgeD}" fill="none" stroke="rgba(230,177,92,0.9)" stroke-width="${expanded ? 1.5 : 1.2}" stroke-linejoin="round" stroke-linecap="round"/>`;
+    body += `<path d="${ridgeD}" fill="none" stroke="rgba(230,177,92,0.9)" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>`;
   }
   if (expanded) body += `<g id="heat-hover-dialog"></g>`;
 

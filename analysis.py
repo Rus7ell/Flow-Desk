@@ -934,7 +934,7 @@ def order_heatmap(bids: list, asks: list) -> list[dict]:
     return bands
 
 
-def order_profile(bids: list, asks: list, bin_count: int = 72) -> list[dict]:
+def order_profile(bids: list, asks: list, bin_count: int = 320) -> list[dict]:
     """Fine bins for the order line. Width stays the real price span and size stays the real notional."""
     bid_levels = [(float(price), float(price) * float(qty)) for price, qty in bids]
     ask_levels = [(float(price), float(price) * float(qty)) for price, qty in asks]
@@ -963,7 +963,7 @@ def order_profile(bids: list, asks: list, bin_count: int = 72) -> list[dict]:
     largest = max(item["notional"] for item in populated) or 1.0
     profile = []
     for item in populated:
-        if item["notional"] < largest * 0.004:
+        if item["notional"] < largest * 0.0012:
             continue
         if item["bid"] > item["ask"] * 1.15:
             side = "bid"
@@ -983,7 +983,7 @@ def order_profile(bids: list, asks: list, bin_count: int = 72) -> list[dict]:
     return profile
 
 
-def order_flow_profile(candles: list[dict], bin_count: int = 64) -> list[dict]:
+def order_flow_profile(candles: list[dict], bin_count: int = 480) -> list[dict]:
     """Spread each candle's taker buy and sell quote across the prices it traded.
 
     The bins cover the full high-to-low range of the candles, so the line is
@@ -1015,7 +1015,12 @@ def order_flow_profile(candles: list[dict], bin_count: int = 64) -> list[dict]:
             bins[index]["buy"] += buy
             bins[index]["sell"] += sell
             continue
-        for item in bins:
+        first = max(0, int((candle_low - low) / step))
+        last = min(bin_count - 1, int((candle_high - low) / step))
+        if candle_high <= bins[last]["low"] and last > first:
+            last -= 1
+        for index in range(first, last + 1):
+            item = bins[index]
             overlap = min(candle_high, item["high"]) - max(candle_low, item["low"])
             if overlap <= 0:
                 continue
@@ -1029,7 +1034,7 @@ def order_flow_profile(candles: list[dict], bin_count: int = 64) -> list[dict]:
     profile = []
     for item in populated:
         notional = item["buy"] + item["sell"]
-        if notional < largest * 0.004:
+        if notional < largest * 0.0012:
             continue
         if item["buy"] > item["sell"] * 1.15:
             side = "buy"
