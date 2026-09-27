@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Flow Desk</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23121611'/%3E%3Cpath d='M6 22l6-8 5 5 9-12' fill='none' stroke='%23e6b15c' stroke-width='2.4'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,560;9..144,640&family=IBM+Plex+Mono:wght@400;500&family=Outfit:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/styles.css?v=7">
+</head>
+<body>
+  <div class="wrap">
+    <header class="top">
+      <div>
+        <p class="kicker">Binance spot</p>
+        <h1>Flow Desk</h1>
+        <p class="sub">Each market has a 4-hour chart of where orders are sitting, a momentum confidence read, and a short summary of the full picture.</p>
+      </div>
+      <div class="actions">
+        <button type="button" id="refresh">Refresh</button>
+        <p id="stamp" class="stamp">Loading the books…</p>
+      </div>
+    </header>
+    <p id="summary" class="summary"></p>
+    <p class="fine">Aligned means at least three of the 15m, 1h, 4h, and 1D timeframes are printing the same swing sequence.</p>
+    <div id="filters" class="filters"></div>
+    <nav id="rail" class="rail" aria-label="Markets"></nav>
+    <main id="desk">
+      <p class="loading">Reading candles, trades, and the visible book for ten markets.</p>
+    </main>
+    <footer>
+      <p>Each chart starts on the full 4h range. The line is traded order flow across that whole range: yellow is smaller size and dark red is the largest. Expand a chart to scroll and zoom the resting book. Momentum confidence mixes that book with 15-minute, 1-hour, 4-hour, and daily structure, RSI, and MACD. This is a market read, not a recommendation to trade.</p>
+    </footer>
+  </div>
+  <dialog id="chart-dialog" aria-labelledby="dialog-title">
+    <div class="dialog-card">
+      <header class="dialog-bar">
+        <div>
+          <p class="kicker" id="dialog-base"></p>
+          <h2 id="dialog-title"></h2>
+          <p class="dialog-range" id="dialog-range"></p>
+        </div>
+        <div class="dialog-tools">
+          <button type="button" data-act="in">Zoom in</button>
+          <button type="button" data-act="out">Zoom out</button>
+          <button type="button" data-act="reset">Reset</button>
+          <button type="button" data-act="close" class="close-chart">Close</button>
+        </div>
+      </header>
+      <div id="dialog-stage"></div>
+      <p class="hint dialog-help">Drag or scroll to move along price. Zoom with the buttons, or pinch. Esc, Close, or the dark backdrop leaves the chart.</p>
+    </div>
+  </dialog>
+  <div id="dialog-tip" class="chart-tip" hidden></div>
+  <script src="/static/app.js?v=9"></script>
+</body>
+</html>
